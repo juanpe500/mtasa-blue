@@ -66,13 +66,21 @@ CWebCore::CWebCore()
 
 CWebCore::~CWebCore()
 {
-    std::ranges::for_each(m_WebViews,
+    // Swap the list out under the lock; close the browsers without holding it so
+    // CEF threads (FindWebView on the IO thread) are never blocked against us
+    std::list<CefRefPtr<CWebView>> webViews;
+    {
+        std::lock_guard<std::mutex> lock(m_WebViewsMutex);
+        webViews.swap(m_WebViews);
+    }
+
+    std::ranges::for_each(webViews,
                           [](const auto& pWebView)
                           {
                               if (pWebView) [[likely]]
                                   pWebView->CloseBrowser();
                           });
-    m_WebViews.clear();
+    webViews.clear();
     CefClearSchemeHandlerFactories();
 
     // Don't call CefShutdown() here to avoid freeze.
@@ -317,7 +325,10 @@ CWebViewInterface* CWebCore::CreateWebView(unsigned int uiWidth, unsigned int ui
 
     // Create our webview implementation
     CefRefPtr<CWebView> pWebView = new CWebView(bIsLocal, pWebBrowserRenderItem, bTransparent);
-    m_WebViews.push_back(pWebView);
+    {
+        std::lock_guard<std::mutex> lock(m_WebViewsMutex);
+        m_WebViews.push_back(pWebView);
+    }
 
     return static_cast<CWebViewInterface*>(pWebView.get());
 }
@@ -330,12 +341,18 @@ void CWebCore::DestroyWebView(CWebViewInterface* pWebViewInterface)
         // Mark as being destroyed to prevent new events/tasks
         pWebView->SetBeingDestroyed(true);
 
+        // Drop the focused reference on the main thread before tearing down
+        ClearFocusedWebViewIfCurrent(pWebView.get());
+
         // Ensure that no attached events or tasks are in the queue
         RemoveWebViewEvents(pWebView.get());
         RemoveWebViewTasks(pWebView.get());
 
         // Remove from list before closing to break reference cycles early
-        m_WebViews.remove(pWebView);
+        {
+            std::lock_guard<std::mutex> lock(m_WebViewsMutex);
+            m_WebViews.remove(pWebView);
+        }
 
         // CloseBrowser will eventually trigger OnBeforeClose which clears m_pWebView
         // This breaks the circular reference: CWebView -> CefBrowser -> CWebView
@@ -363,6 +380,10 @@ CWebView* CWebCore::FindWebView(CefRefPtr<CefBrowser> browser)
     if (!browser)
         return nullptr;
 
+    // Runs on CEF threads (e.g. the IO thread via the scheme handler) while the
+    // main thread creates/destroys web views, so the list must be locked
+    std::lock_guard<std::mutex> lock(m_WebViewsMutex);
+
     for (const auto& pWebView : m_WebViews)
     {
         if (!pWebView)
@@ -389,37 +410,54 @@ void CWebCore::AddEventToEventQueue(std::function<void()> event, CWebView* pWebV
     if (pWebView && pWebView->IsBeingDestroyed())
         return;
 
-    std::scoped_lock lock(m_EventQueueMutex);
+    bool bQueueLimitReached = false;
 
-    // Prevent unbounded queue growth - drop oldest events if queue is too large
-    if (m_EventQueue.size() >= MAX_EVENT_QUEUE_SIZE)
+    // Entries moved out of the queue are destroyed AFTER the lock is released:
+    // destroying an entry may drop the last reference to a web view, and
+    // ~CWebView queues an event itself (render item release), which would
+    // deadlock on m_EventQueueMutex if it ran inside this critical section
+    std::list<EventEntry> droppedEvents;
     {
-        // Log warning even in release builds as this indicates a serious issue
-        g_pCore->GetConsole()->Printf("WARNING: Browser event queue size limit reached (%d), dropping oldest events", MAX_EVENT_QUEUE_SIZE);
+        std::scoped_lock lock(m_EventQueueMutex);
 
-        // Remove oldest 10% of events to make room
-        auto removeCount = static_cast<size_t>(MAX_EVENT_QUEUE_SIZE / 10);
-        for (auto i = size_t{0}; i < removeCount && !m_EventQueue.empty(); ++i)
-            m_EventQueue.pop_front();
-    }
+        // Prevent unbounded queue growth - drop oldest events if queue is too large
+        if (m_EventQueue.size() >= MAX_EVENT_QUEUE_SIZE)
+        {
+            bQueueLimitReached = true;
+
+            // Move oldest 10% of events out to make room
+            auto removeCount = static_cast<size_t>(MAX_EVENT_QUEUE_SIZE / 10);
+            for (auto i = size_t{0}; i < removeCount && !m_EventQueue.empty(); ++i)
+                droppedEvents.splice(droppedEvents.end(), m_EventQueue, m_EventQueue.begin());
+        }
 
 #ifndef MTA_DEBUG
-    m_EventQueue.push_back(EventEntry(event, pWebView));
+        m_EventQueue.push_back(EventEntry(event, pWebView));
 #else
-    m_EventQueue.push_back(EventEntry(event, pWebView, name));
+        m_EventQueue.push_back(EventEntry(event, pWebView, name));
 #endif
+    }
+
+    // Log warning even in release builds as this indicates a serious issue
+    if (bQueueLimitReached)
+        g_pCore->GetConsole()->Printf("WARNING: Browser event queue size limit reached (%d), dropping oldest events", MAX_EVENT_QUEUE_SIZE);
 }
 
 void CWebCore::RemoveWebViewEvents(CWebView* pWebView)
 {
-    std::scoped_lock lock(m_EventQueueMutex);
-
-    for (auto iter = m_EventQueue.begin(); iter != m_EventQueue.end();)
+    // Move matching entries out under the lock and destroy them afterwards (see
+    // AddEventToEventQueue for why entries must not be destroyed under the lock)
+    std::list<EventEntry> removedEvents;
     {
-        // Increment iterator before we remove the element from the list (to guarantee iterator validity)
-        auto tempIterator = iter++;
-        if (tempIterator->pWebView == pWebView)
-            m_EventQueue.erase(tempIterator);
+        std::scoped_lock lock(m_EventQueueMutex);
+
+        for (auto iter = m_EventQueue.begin(); iter != m_EventQueue.end();)
+        {
+            // Increment iterator before we remove the element from the list (to guarantee iterator validity)
+            auto tempIterator = iter++;
+            if (tempIterator->pWebView == pWebView)
+                removedEvents.splice(removedEvents.end(), m_EventQueue, tempIterator);
+        }
     }
 }
 
@@ -440,10 +478,17 @@ void CWebCore::DoEventQueuePulse()
         event.callback();
     }
 
+    // Snapshot the list so we do not hold the lock while calling into CEF/D3D
+    std::vector<CefRefPtr<CWebView>> webViews;
+    {
+        std::lock_guard<std::mutex> lock(m_WebViewsMutex);
+        webViews.assign(m_WebViews.begin(), m_WebViews.end());
+    }
+
     // Request new frames from CEF using external begin frame scheduling
     // This synchronizes CEF rendering with MTA's render loop, eliminating
     // the previous 250ms blocking wait in OnPaint
-    for (auto& view : m_WebViews)
+    for (auto& view : webViews)
     {
         if (view->IsBeingDestroyed() || view->GetRenderingPaused())
             continue;
@@ -454,7 +499,7 @@ void CWebCore::DoEventQueuePulse()
     }
 
     // Copy rendered data to D3D textures on the main thread
-    for (auto& view : m_WebViews)
+    for (auto& view : webViews)
     {
         view->UpdateTexture();
     }
@@ -784,16 +829,22 @@ void CWebCore::OnPreScreenshot()
 
 void CWebCore::OnPostScreenshot()
 {
-    // Re-draw textures
+    std::lock_guard<std::mutex> lock(m_WebViewsMutex);
+
+    // Re-draw textures. GetCefBrowser() may return nullptr for views whose
+    // browser is still being created asynchronously (or already closed)
     for (auto& pWebView : m_WebViews)
     {
-        pWebView->GetCefBrowser()->GetHost()->Invalidate(CefBrowserHost::PaintElementType::PET_VIEW);
+        if (auto pBrowser = pWebView->GetCefBrowser(); pBrowser) [[likely]]
+            pBrowser->GetHost()->Invalidate(CefBrowserHost::PaintElementType::PET_VIEW);
     }
 }
 
 void CWebCore::OnFPSLimitChange(std::uint16_t fps)
 {
     dassert(g_pCore->GetNetwork() != nullptr);  // Ensure network module is loaded
+
+    std::lock_guard<std::mutex> lock(m_WebViewsMutex);
     for (auto& webView : m_WebViews)
     {
         if (auto browser = webView->GetCefBrowser(); browser) [[likely]]
@@ -803,7 +854,9 @@ void CWebCore::OnFPSLimitChange(std::uint16_t fps)
 
 void CWebCore::ProcessInputMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
-    if (!m_pFocusedWebView ||
+    // Load once: the focused view may be cleared concurrently from the CEF UI thread
+    CWebView* pFocusedWebView = m_pFocusedWebView.load();
+    if (!pFocusedWebView ||
         !(uMsg == WM_KEYDOWN || uMsg == WM_KEYUP || uMsg == WM_CHAR || uMsg == WM_SYSCHAR || uMsg == WM_SYSKEYDOWN || uMsg == WM_SYSKEYUP))
         return;
 
@@ -832,11 +885,13 @@ void CWebCore::ProcessInputMessage(UINT uMsg, WPARAM wParam, LPARAM lParam)
         }
     }
 
-    m_pFocusedWebView->InjectKeyboardEvent(keyEvent);
+    pFocusedWebView->InjectKeyboardEvent(keyEvent);
 }
 
 void CWebCore::ClearTextures()
 {
+    std::lock_guard<std::mutex> lock(m_WebViewsMutex);
+
     for (auto& pWebBrowser : m_WebViews)
     {
         pWebBrowser->ClearTexture();
@@ -848,6 +903,8 @@ bool CWebCore::SetGlobalAudioVolume(float fVolume)
     if (fVolume < 0.0f || fVolume > 1.0f)
         return false;
 
+    std::lock_guard<std::mutex> lock(m_WebViewsMutex);
+
     for (auto& pWebView : m_WebViews)
     {
         pWebView->SetAudioVolume(fVolume);
@@ -857,7 +914,7 @@ bool CWebCore::SetGlobalAudioVolume(float fVolume)
 
 CWebViewInterface* CWebCore::GetFocusedWebView()
 {
-    return m_pFocusedWebView;
+    return m_pFocusedWebView.load();
 }
 
 bool CWebCore::UpdateListsFromMaster()

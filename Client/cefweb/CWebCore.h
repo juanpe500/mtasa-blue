@@ -11,6 +11,7 @@
 
 #undef GetNextSibling
 #undef GetFirstChild
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <unordered_set>
@@ -92,9 +93,18 @@ public:
     void DebugOutputThreadsafe(const SString& message, unsigned char R, unsigned char G, unsigned char B);
 
     CWebViewInterface* GetFocusedWebView();
-    void               SetFocusedWebView(CWebView* pWebView) { m_pFocusedWebView = pWebView; };
-    void               ProcessInputMessage(UINT uMsg, WPARAM wParam, LPARAM lParam);
-    void               ClearTextures();
+    void               SetFocusedWebView(CWebView* pWebView) { m_pFocusedWebView.store(pWebView); };
+
+    // Clear the focused web view only if it still points at the given view.
+    // Used from the CEF UI thread (OnBeforeClose), hence the compare-and-swap.
+    void ClearFocusedWebViewIfCurrent(CWebView* pWebView)
+    {
+        CWebView* expected = pWebView;
+        m_pFocusedWebView.compare_exchange_strong(expected, nullptr);
+    }
+
+    void ProcessInputMessage(UINT uMsg, WPARAM wParam, LPARAM lParam);
+    void ClearTextures();
 
     bool GetRemotePagesEnabled();
     bool GetRemoteJavascriptEnabled();
@@ -122,9 +132,10 @@ private:
     typedef std::pair<bool, eWebFilterType> WebFilterPair;
 
     CWebsiteRequests*              m_pRequestsGUI;
-    std::list<CefRefPtr<CWebView>> m_WebViews;
+    std::list<CefRefPtr<CWebView>> m_WebViews;  // Guarded by m_WebViewsMutex (FindWebView runs on the CEF IO thread)
+    std::mutex                     m_WebViewsMutex;
     bool                           m_bTestmodeEnabled;
-    CWebView*                      m_pFocusedWebView;
+    std::atomic<CWebView*>         m_pFocusedWebView;  // Cleared from the CEF UI thread in OnBeforeClose
 
     std::list<EventEntry> m_EventQueue;
     std::mutex            m_EventQueueMutex;

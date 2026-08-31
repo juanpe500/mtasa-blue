@@ -24,6 +24,7 @@
 #include <cef3/cef/include/cef_values.h>
 #include <SString.h>
 #include <audiopolicy.h>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <mmdeviceapi.h>
@@ -66,7 +67,15 @@ public:
     void                  ClearWebBrowserEvents(CWebBrowserEventsInterface* pInterface);
     void                  CloseBrowser();
     bool                  EnsureBrowserCreated();  // Lazy creation: creates browser on first use
-    CefRefPtr<CefBrowser> GetCefBrowser() { return m_pWebView; };
+
+    // Thread-safe accessor: m_pWebView is written on the CEF UI thread (OnAfterCreated,
+    // OnBeforeClose) and read from the main thread and the CEF IO thread, so every
+    // access has to go through the browser mutex
+    CefRefPtr<CefBrowser> GetCefBrowser() const
+    {
+        std::lock_guard<std::mutex> lock(m_BrowserMutex);
+        return m_pWebView;
+    }
 
     bool IsBeingDestroyed() { return m_bBeingDestroyed; }
     void SetBeingDestroyed(bool state) { m_bBeingDestroyed = state; }
@@ -261,15 +270,18 @@ private:
         uint64_t                    generation = 0;
     };
 
+    // Guards m_pWebView and the pending URL state (main thread stores a pending URL
+    // while the CEF UI thread may concurrently assign the browser in OnAfterCreated)
+    mutable std::mutex    m_BrowserMutex;
     CefRefPtr<CefBrowser> m_pWebView;
     CWebBrowserItem*      m_pWebBrowserRenderItem;
 
     std::atomic_bool                      m_bBeingDestroyed;
     bool                                  m_bIsLocal;
-    bool                                  m_bIsRenderingPaused;
+    std::atomic_bool                      m_bIsRenderingPaused;  // Written on main thread, read on CEF UI thread (OnAfterCreated)
     bool                                  m_bIsTransparent;
     bool                                  m_bBrowserCreated = false;  // Lazy creation: tracks if CEF browser has been created
-    SString                               m_strPendingURL;            // Lazy creation: URL to load when browser is ready
+    SString                               m_strPendingURL;            // Lazy creation: URL to load when browser is ready (guarded by m_BrowserMutex)
     bool                                  m_bPendingURLFilterEnabled = true;
     SString                               m_strPendingPostData;
     bool                                  m_bPendingURLEncoded = true;
@@ -278,11 +290,13 @@ private:
     bool                                  m_bHasPendingMouseMove = false;  // Whether there's a pending throttled mouse move
     std::chrono::steady_clock::time_point m_lastMouseMoveTime;             // For mouse move throttling
     bool                                  m_mouseButtonStates[3];
-    SString                               m_CurrentTitle;
-    float                                 m_fVolume;
-    std::map<SString, SString>            m_Properties;
+    SString                               m_CurrentTitle;  // Main thread only (OnTitleChange defers the update to the main thread)
+    std::atomic<float>                    m_fVolume;       // Written on main thread and CEF UI thread (OnLoadEnd)
+    std::map<SString, SString>            m_Properties;    // Guarded by m_PropertiesMutex (read on the CEF IO thread)
+    mutable std::mutex                    m_PropertiesMutex;
     bool                                  m_bHasInputFocus;
-    std::set<std::string>                 m_AjaxHandlers;
+    std::set<std::string>                 m_AjaxHandlers;  // Guarded by m_AjaxMutex (read on the CEF IO thread)
+    mutable std::mutex                    m_AjaxMutex;
     std::shared_ptr<FEventTarget>         m_pEventTarget;
 
     struct
